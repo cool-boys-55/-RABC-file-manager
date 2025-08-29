@@ -227,7 +227,6 @@ router.get("/:id", auth(["admin", "sub-admin", "user"]), async (req, res) => {
     });
   }
 });
-
 // ✅ Update Folder (with parentFolder support)
 router.put("/:id", auth(["admin", "sub-admin", "user"]), async (req, res) => {
   try {
@@ -609,7 +608,7 @@ router.get('/files/:fileId', auth(['admin', 'sub-admin', 'user']), async (req, r
 });
 
 // ✅ FIXED: Upload files route with correct approval logic
-// ✅ FIXED: Upload files route with correct approval logic
+// ✅ FIXED: Upload files route with correct versioning logic
 router.post(
   "/:id/files",
   auth(["admin", "sub-admin", "user"]),
@@ -646,105 +645,158 @@ router.post(
           .json({ success: false, error: "Write access required" });
       }
 
-      // ✅ FIXED: Define approval status at the start (not inside loop)
-      const isAutoApproved = req.user.role === "admin" || req.user.role === "sub-admin";
+      // ✅ Approval setup
+      const isAutoApproved =
+        req.user.role === "admin" || req.user.role === "sub-admin";
       const approvalStatus = isAutoApproved ? "approved" : "pending";
 
       const savedFiles = [];
 
       for (const file of uploadedFiles) {
-        const finalPath = path
-          .join(storage.STORAGE_ROOT, folder.path, file.originalname)
-          .replace(/\\/g, "/");
-        const dirPath = path.dirname(finalPath);
+        const originalName = file.originalname;
+        const dirPath = path.join(storage.STORAGE_ROOT, folder.path);
 
         if (!fs.existsSync(dirPath)) {
           await fsp.mkdir(dirPath, { recursive: true });
         }
 
-        // ✅ Always compute file hash first
+        // ✅ FIXED: Better versioning logic
+        // First, find all files with the same originalFilename in this folder
+        const existingVersions = await File.find({
+          folder: folder._id,
+          originalFilename: originalName,
+          isDeleted: { $ne: true },
+        }).sort({ version: -1 });
+
+        // Calculate the next version number
+        const nextVersion = existingVersions.length > 0 
+          ? existingVersions[0].version + 1 
+          : 1;
+
+        // ✅ Generate versioned filename
+        const versionedName = File.generateVersionedName(
+          originalName,
+          nextVersion,
+          req.body.versionFormat || "number"
+        );
+
+        // ✅ Check if a file with this exact filename already exists in the folder
+        const existingFileWithName = await File.findOne({
+          folder: folder._id,
+          filename: versionedName,
+          isDeleted: { $ne: true }
+        });
+
+        if (existingFileWithName) {
+          // If filename collision occurs, find the next available number
+          let counter = nextVersion;
+          let availableName = versionedName;
+          
+          while (await File.findOne({ 
+            folder: folder._id, 
+            filename: availableName, 
+            isDeleted: { $ne: true } 
+          })) {
+            counter++;
+            availableName = File.generateVersionedName(originalName, counter, "number");
+          }
+          
+          versionedName = availableName;
+        }
+
+        const finalPath = path.join(dirPath, versionedName).replace(/\\/g, "/");
+
+        // ✅ Check if physical file already exists
+        if (fs.existsSync(finalPath)) {
+          console.warn(`Physical file already exists: ${finalPath}`);
+          continue; // Skip this file
+        }
+
+        // ✅ Compute file hash for duplicate detection
         const hash = crypto.createHash("sha256");
         const stream = fs.createReadStream(file.path);
-
         await new Promise((resolve, reject) => {
           stream.on("data", (chunk) => hash.update(chunk));
           stream.on("end", resolve);
           stream.on("error", reject);
         });
-
         const fileHash = hash.digest("hex");
 
-        // ✅ Check if file already exists
-        let existingFile = await File.findOne({ path: finalPath });
-        if (existingFile) {
-          // Replace file content
-          await fsp.rename(file.path, finalPath);
+        // ✅ Check for duplicate content by hash
+        const duplicateFile = await File.findOne({
+          folder: folder._id,
+          fileHash: fileHash,
+          isDeleted: { $ne: true }
+        });
 
-          // Update metadata
-          existingFile.size = file.size;
-          existingFile.mimetype = file.mimetype;
-          existingFile.extension = path.extname(file.originalname);
-          existingFile.fileHash = fileHash;
-          existingFile.uploadedBy = req.user._id;
-
-          // ✅ FIXED: Update approval status correctly
-          existingFile.approvalStatus = approvalStatus;
-          if (isAutoApproved) {
-            existingFile.approvedBy = req.user._id;
-            existingFile.approvedAt = new Date();
-            existingFile.disapprovalReason = undefined;
-            existingFile.rejectedBy = undefined;
-            existingFile.rejectedAt = undefined;
-          }
-
-          await existingFile.save();
-          savedFiles.push(existingFile);
-          continue; // Skip insert
-        }
-
-        try {
-          // ✅ Insert new file
-          await fsp.rename(file.path, finalPath);
-
-          const newFile = new File({
-            filename: file.originalname,
-            originalFilename: file.originalname,
-            path: finalPath,
-            size: file.size,
-            mimetype: file.mimetype,
-            extension: path.extname(file.originalname),
-            folder: folder._id,
-            owner: req.user._id,
-            uploadedBy: req.user._id,
-            fileHash,
-            approvalStatus, // ✅ Now properly defined
-            // ✅ Set approval fields for admin/sub-admin uploads
-            ...(isAutoApproved && {
-              approvedBy: req.user._id,
-              approvedAt: new Date(),
-            }),
+        if (duplicateFile) {
+          console.log(`Duplicate file detected (same content): ${originalName}`);
+          // You might want to return info about the duplicate instead of saving
+          savedFiles.push({
+            ...duplicateFile.toObject(),
+            message: "File already exists with same content",
+            isDuplicate: true
           });
-
-          await newFile.save();
-          savedFiles.push(newFile);
-        } catch (err) {
-          if (err.code === 11000) {
-            // Race condition duplicate key
-            console.warn("Duplicate detected, skipping:", finalPath);
-            continue;
-          }
-          throw err; // Other DB errors
+          continue;
         }
+
+        // ✅ Move uploaded file to final location
+        await fsp.rename(file.path, finalPath);
+
+        // ✅ Create new file record
+        const newFile = new File({
+          filename: versionedName,
+          originalFilename: originalName,
+          path: finalPath,
+          size: file.size,
+          mimetype: file.mimetype,
+          extension: path.extname(originalName).toLowerCase(),
+          folder: folder._id,
+          owner: req.user._id,
+          uploadedBy: req.user._id,
+          fileHash,
+          approvalStatus,
+          version: nextVersion,
+          isCurrentVersion: true,
+          ...(isAutoApproved && {
+            approvedBy: req.user._id,
+            approvedAt: new Date(),
+          }),
+          ...(existingVersions.length > 0 && {
+            originalFile: existingVersions[0].originalFile || existingVersions[0]._id,
+          }),
+        });
+
+        await newFile.save();
+
+        // ✅ Update previous versions to not be current
+        if (existingVersions.length > 0) {
+          await File.updateMany(
+            {
+              originalFilename: originalName,
+              folder: folder._id,
+              _id: { $ne: newFile._id }, // Don't update the new file we just created
+              isDeleted: { $ne: true }
+            },
+            { isCurrentVersion: false }
+          );
+
+          // Update the new file's previousVersions array
+          newFile.previousVersions = existingVersions.map((v) => v._id);
+          await newFile.save();
+        }
+
+        console.log(`File saved with versioning: ${versionedName} (version ${nextVersion})`);
+        savedFiles.push(newFile);
       }
 
       if (savedFiles.length === 0) {
         return res.status(409).json({
           success: false,
-          error: "All files already exist and were unchanged",
+          error: "No new files were uploaded (duplicates or conflicts detected)",
         });
       }
 
-      // ✅ FIXED: Now using the properly scoped approvalStatus
       res.status(201).json({
         success: true,
         count: savedFiles.length,
@@ -1245,4 +1297,125 @@ router.patch(
   }
 );
 
+// Get all versions of a file
+router.get('/files/:id/versions', auth(), async (req, res) => {
+  try {
+    const versions = await File.findVersions(req.params.id);
+    
+    if (!versions || versions.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: "File not found or no versions available"
+      });
+    }
+
+    // Check access to the original file
+    const hasAccess = req.user.role === "admin" || 
+      versions[0].owner.equals(req.user._id) ||
+      (versions[0].folder && await validateFolderAccess(versions[0].folder, req.user._id));
+
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: "Access denied"
+      });
+    }
+
+    res.json({
+      success: true,
+      data: versions
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "Failed to retrieve versions"
+    });
+  }
+});
+
+// Restore a previous version
+router.post('/files/:id/restore', auth(["admin", "sub-admin", "user"]), async (req, res) => {
+  try {
+    const versionToRestore = await File.findById(req.params.id);
+    
+    if (!versionToRestore) {
+      return res.status(404).json({
+        success: false,
+        error: "Version not found"
+      });
+    }
+
+    // Check access
+    const hasAccess = req.user.role === "admin" || 
+      versionToRestore.owner.equals(req.user._id) ||
+      (versionToRestore.folder && await validateFolderAccess(versionToRestore.folder, req.user._id));
+
+    if (!hasAccess) {
+      return res.status(403).json({
+        success: false,
+        error: "Access denied"
+      });
+    }
+
+    // Get current version
+    const currentVersion = await File.findOne({
+      originalFile: versionToRestore.originalFile || versionToRestore._id,
+      isCurrentVersion: true
+    });
+
+    if (!currentVersion) {
+      return res.status(400).json({
+        success: false,
+        error: "Current version not found"
+      });
+    }
+
+    // Create a copy of the version we're restoring (as a new version)
+    const newVersion = new File({
+      ...versionToRestore.toObject(),
+      _id: undefined,
+      version: currentVersion.version + 1,
+      isCurrentVersion: true,
+      previousVersions: [...currentVersion.previousVersions, currentVersion._id],
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    // Copy the physical file
+    const newPath = path.join(
+      path.dirname(versionToRestore.path),
+      File.generateVersionedName(
+        versionToRestore.originalFilename,
+        newVersion.version,
+        'number'
+      )
+    );
+
+    await fsp.copyFile(versionToRestore.path, newPath);
+    newVersion.path = newPath;
+
+    // Save new version
+    await newVersion.save();
+
+    // Mark old versions as not current
+    await File.updateMany(
+      { 
+        _id: { $in: [versionToRestore._id, currentVersion._id] },
+        originalFilename: versionToRestore.originalFilename 
+      },
+      { isCurrentVersion: false }
+    );
+
+    res.json({
+      success: true,
+      data: newVersion,
+      message: "Version restored successfully"
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: "Failed to restore version"
+    });
+  }
+});
 module.exports = router;

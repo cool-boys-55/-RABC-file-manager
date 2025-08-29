@@ -10,8 +10,8 @@ const config = require('./config/config');
 const connectToDB = require('./config/db');
 const userRoute = require('./routes/user');
 const authRoute = require('./routes/auth');
-// const fileRoute = require('./routes/file');
 const folderRoute = require('./routes/folder');
+const assetRoute = require('./routes/asset');
 const File = require('./models/file.model'); 
 const storage = require('./utils/storage'); 
 
@@ -77,8 +77,8 @@ app.get('/debug-file-path/:id', async (req, res) => {
 // Routes
 app.use('/api/user', userRoute);
 app.use('/api/auth', authRoute);
-// app.use('/api/file', fileRoute);
 app.use('/api/folder', folderRoute);
+app.use('/api/asset', assetRoute);
 
 // Unified error handlerx`
 app.use((err, req, res, next) => {

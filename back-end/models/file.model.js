@@ -3,6 +3,9 @@ const crypto = require('crypto');
 const path = require('path');
 const storage = require('../utils/storage');
 
+// ------------------
+// Schema definition
+// ------------------
 const fileSchema = new mongoose.Schema({
   // Core file properties
   filename: {
@@ -11,7 +14,7 @@ const fileSchema = new mongoose.Schema({
     trim: true,
     validate: {
       validator: function (v) {
-        return /^[\w\-. ]+$/.test(v);
+        return /^[\w\-. ()]+$/.test(v);
       },
       message: props => `${props.value} contains invalid characters`
     }
@@ -59,7 +62,7 @@ const fileSchema = new mongoose.Schema({
     required: true
   },
 
-  // ✅ FIXED: Use approvalStatus to match the routes
+  // Approval system
   approvalStatus: {
     type: String,
     enum: ['pending', 'approved', 'disapproved'],
@@ -77,6 +80,24 @@ const fileSchema = new mongoose.Schema({
     ref: 'User'
   },
   rejectedAt: Date,
+
+  // Versioning
+  version: {
+    type: Number,
+    default: 1
+  },
+  isCurrentVersion: {
+    type: Boolean,
+    default: true
+  },
+  previousVersions: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'File'
+  }],
+  originalFile: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'File'
+  },
 
   // File integrity
   fileHash: {
@@ -121,8 +142,8 @@ const fileSchema = new mongoose.Schema({
     type: Number,
     default: 0
   },
-  
-  // ✅ ADDED: Soft delete support
+
+  // Soft delete support
   isDeleted: {
     type: Boolean,
     default: false
@@ -225,39 +246,77 @@ fileSchema.pre('deleteOne', { document: true, query: false }, async function (ne
 // ------------------
 // Static methods
 // ------------------
+
+// Find file by hash
 fileSchema.statics.findByHash = function (hash) {
   return this.findOne({ fileHash: hash });
 };
 
+// Find all files in a folder
 fileSchema.statics.findByFolder = function (folderId) {
   return this.find({ folder: folderId }).sort({ filename: 1 });
+};
+
+// Generate versioned filename
+// ✅ FIXED: Generate versioned filename
+fileSchema.statics.generateVersionedName = function (originalName, version, format = 'number') {
+  const ext = path.extname(originalName);
+  const baseName = path.basename(originalName, ext);
+
+  if (format === 'date') {
+    const dateStr = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+    return `${baseName}_${dateStr}${ext}`;
+  } else {
+    // ✅ FIXED: Proper numbered versioning
+    // Version 1 = original name, Version 2 = name(1), Version 3 = name(2), etc.
+    return version === 1 ? originalName : `${baseName}(${version - 1})${ext}`;
+  }
+};
+
+// Find all versions of a file
+fileSchema.statics.findVersions = async function (fileId) {
+  const currentFile = await this.findById(fileId);
+  if (!currentFile) return null;
+
+  const originalFileId = currentFile.originalFile || currentFile._id;
+
+  const versions = await this.find({
+    $or: [
+      { _id: originalFileId },       // The original file
+      { originalFile: originalFileId } // All its versions
+    ]
+  }).sort({ version: 1 }); // Oldest first
+
+  return versions;
 };
 
 // ------------------
 // Instance methods
 // ------------------
+
+// Increment downloads
 fileSchema.methods.incrementDownloadCount = async function () {
   this.downloadCount += 1;
   return this.save();
 };
 
+// Approve file
 fileSchema.methods.approve = async function (userId) {
-  this.approvalStatus = 'approved'; // ✅ FIXED: Use approvalStatus
+  this.approvalStatus = 'approved';
   this.approvedBy = userId;
   this.approvedAt = new Date();
-  // Clear any rejection data
   this.disapprovalReason = undefined;
   this.rejectedBy = undefined;
   this.rejectedAt = undefined;
   return this.save();
 };
 
+// Reject file
 fileSchema.methods.reject = async function (userId, reason) {
-  this.approvalStatus = 'disapproved'; // ✅ FIXED: Use approvalStatus
+  this.approvalStatus = 'disapproved';
   this.rejectedBy = userId;
   this.disapprovalReason = reason;
   this.rejectedAt = new Date();
-  // Clear any approval data
   this.approvedBy = undefined;
   this.approvedAt = undefined;
   return this.save();
